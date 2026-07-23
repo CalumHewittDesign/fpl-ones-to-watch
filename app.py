@@ -175,6 +175,10 @@ def build_player_table(bootstrap, fixtures, horizon_gws):
         team_id = p["team"]
         team = teams[team_id]
         pos = POSITIONS[p["element_type"]]
+        opp_list = opp_1.get(team_id, [])
+        next_fixture = ", ".join(
+            f"{teams[o]['short_name']} ({venue})" for o, venue in opp_list
+        ) or "BLANK"
         tf = team_form.get(team_id, {"scored": 0.0, "conceded": 0.0})
         # attackers care about goals scored; defenders/keepers about goals conceded
         if pos in ("MID", "FWD"):
@@ -190,6 +194,7 @@ def build_player_table(bootstrap, fixtures, horizon_gws):
             "team_id": team_id,
             "team": team["short_name"],
             "pos": pos,
+            "next_fixture": next_fixture,
             "price": p["now_cost"] / 10.0,
             "price_raw": p["now_cost"],
             "form": float(p.get("form") or 0),
@@ -341,10 +346,11 @@ def solve_squad(df, budget_m, score_col, bench_mode):
 # Display helpers
 # ---------------------------------------------------------------------------
 def show_table(df, score_col, extra_cols=None):
-    cols = ["name", "team", "pos", "price", "form", "ownership"] + (extra_cols or []) + [score_col]
+    cols = ["name", "team", "pos", "next_fixture", "price", "form", "ownership"] + (extra_cols or []) + [score_col]
     out = df[cols].rename(columns={
         "name": "Player", "team": "Team", "pos": "Pos", "price": "Price (£m)",
         "form": "Form", "ownership": "Owned %", "fixtures_this_gw": "Fixtures",
+        "next_fixture": "Next",
         score_col: "Score",
     })
     out["Score"] = out["Score"].round(3)
