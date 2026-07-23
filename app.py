@@ -109,7 +109,7 @@ TOUCH_ICON_PATH = "static/apple-touch-icon.png"
 # Home screen icon URL. Leave "" to use the app's own static serving; if that
 # isn't working, paste the GitHub "Raw" URL of apple-touch-icon.png here, e.g.
 # "https://raw.githubusercontent.com/YOUR-USERNAME/fpl-ones-to-watch/main/static/apple-touch-icon.png"
-TOUCH_ICON_URL = ""
+TOUCH_ICON_URL = "https://raw.githubusercontent.com/CalumHewittDesign/fpl-ones-to-watch/main/static/apple-touch-icon.png"
 
 # FPL sometimes rejects requests without a browser-like user agent
 HEADERS = {"User-Agent": "Mozilla/5.0 (personal FPL recommender)"}
