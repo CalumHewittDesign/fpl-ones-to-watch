@@ -12,9 +12,15 @@ Tabs:
 
 Data comes from the free, unofficial FPL API (no login needed).
 Squad building uses PuLP (a linear-programming solver).
+Injuries, suspensions and fitness are factored in - see the availability
+section below and the CONFIG comments.
 
 All the numbers you might want to tweak live in CONFIG just below.
 """
+
+import datetime as dt
+import re
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import pandas as pd
@@ -35,7 +41,7 @@ CONFIG = {
     "team_form_matches": 5,
 
     # How many finished gameweeks before the app fully trusts current-season
-    # form (before that it blends in pre-season signals - see notes in guide)
+    # form (before that it blends in pre-season signals)
     "form_trust_gws": 3,
 
     # Bench players count for this fraction of a starter in squad optimisation
@@ -56,8 +62,33 @@ CONFIG = {
     # inside the Differentials score
     "involvement_weight": 0.15,
 
-    # Minutes gate once form is trusted: a player must have played at least
-    # this share of possible minutes to be recommended
+    # ------------------- Availability (injuries/suspensions) ---------------
+    # A player back from injury/suspension counts at this fraction for their
+    # first week back (unless FPL's 25/50/75% flag says otherwise) ...
+    "post_return_start": 0.75,
+    # ... and recovers by this much each following gameweek, up to 100%
+    "recovery_ramp_per_gw": 0.25,
+    # If FPL says a player is out but gives no return date, later weeks of the
+    # horizon are treated as a coin flip
+    "unknown_absence_prob": 0.5,
+    # Players below this average availability across the window are dropped
+    "min_window_availability": 0.2,
+
+    # ------------------- Fitness/rotation ramp -----------------------------
+    # Judged on minutes over the last ramp_recent_gws gameweeks: full credit
+    # at ramp_full_minutes, scaling down to ramp_floor for zero minutes
+    "ramp_recent_gws": 3,
+    "ramp_full_minutes": 180,
+    "ramp_floor": 0.7,
+    # ... and a player must have at least this many recent minutes to appear
+    # in recommendations at all (season underway only)
+    "gate_recent_minutes": 90,
+    # How many top candidates get their match history fetched per refresh
+    # (kept modest to stay polite to the FPL API)
+    "shortlist_size": 200,
+
+    # Fallback minutes gate for players outside the shortlist: at least this
+    # share of possible season minutes
     "min_minutes_share": 0.5,
 }
 
@@ -81,6 +112,125 @@ def fetch_fpl_data():
     fixtures = requests.get(API_BASE + "fixtures/", headers=HEADERS, timeout=30)
     fixtures.raise_for_status()
     return bootstrap.json(), fixtures.json()
+
+
+@st.cache_data(ttl=1800, show_spinner="Checking recent minutes for top candidates...")
+def fetch_recent_minutes(player_ids, since_round):
+    """
+    Minutes played after gameweek `since_round`, per player, from FPL's
+    element-summary endpoint. Only called for a shortlist of top candidates.
+    A player whose fetch fails maps to None (the caller falls back gracefully).
+    """
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    def one(pid):
+        try:
+            r = session.get(f"{API_BASE}element-summary/{pid}/", timeout=15)
+            r.raise_for_status()
+            hist = r.json().get("history", [])
+            return pid, sum(h.get("minutes", 0) for h in hist
+                            if h.get("round", 0) > since_round)
+        except Exception:
+            return pid, None
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        return dict(ex.map(one, player_ids))
+
+
+# ---------------------------------------------------------------------------
+# Availability (injuries, suspensions, fitness)
+# ---------------------------------------------------------------------------
+def play_probability(status, chance):
+    """Chance of playing the NEXT gameweek, from FPL's own flags (0..1).
+    status: a=available, d=doubtful, i=injured, s=suspended, u=unavailable."""
+    if chance is not None:
+        return max(0.0, min(chance / 100.0, 1.0))
+    return {"a": 1.0, "d": 0.75}.get(status, 0.0)
+
+
+def window_deadlines(events, start_gw, n_gws):
+    """Deadline datetime for each gameweek in the window (extrapolates weekly
+    if a deadline is missing, so the maths never falls over)."""
+    by_id = {e["id"]: e.get("deadline_time") for e in events}
+    out, prev = [], None
+    for gw in range(start_gw, start_gw + n_gws):
+        raw = by_id.get(gw)
+        if raw:
+            d = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        elif prev is not None:
+            d = prev + dt.timedelta(days=7)
+        else:
+            d = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=7 * (gw - start_gw + 1))
+        out.append(d)
+        prev = d
+    return out
+
+
+def parse_return_date(news, anchor):
+    """Pull a return date out of FPL's news text, e.g. 'Suspended until 30 Aug'
+    or 'Knee injury - Expected back 12 Sep'. Returns None if there isn't one.
+    `anchor` (the first deadline in the window) supplies the year."""
+    if not news:
+        return None
+    m = re.search(r"(?:until|back)\s+(\d{1,2})\s+([A-Za-z]{3})", news)
+    if not m:
+        return None
+    try:
+        month = dt.datetime.strptime(m.group(2).title(), "%b").month
+        d = dt.datetime(anchor.year, month, int(m.group(1)), tzinfo=dt.timezone.utc)
+    except ValueError:
+        return None
+    if d < anchor - dt.timedelta(days=45):  # a date months in the past means next year
+        d = d.replace(year=anchor.year + 1)
+    return d
+
+
+def availability_schedule(status, chance, return_date, deadlines):
+    """
+    Expected chance of playing (0..1) for each gameweek in the window.
+      - status 'u' (left club / unavailable): 0 throughout
+      - return date known from the news: 0 before it, then a ramp back to
+        full fitness starting at post_return_start (or the FPL % if set)
+      - FPL 25/50/75% flag with no date: that chance next week, recovering
+        by recovery_ramp_per_gw each following week
+      - out (injured/suspended) with no date: 0 next week, then a coin flip
+      - fully fit: 1.0 throughout
+    """
+    ramp = CONFIG["recovery_ramp_per_gw"]
+    n = len(deadlines)
+    if status == "u":
+        return [0.0] * n
+    if return_date is not None:
+        probs, p = [], None
+        for d in deadlines:
+            if d < return_date:
+                probs.append(0.0)
+            else:
+                if p is None:
+                    p = (chance / 100.0) if chance else CONFIG["post_return_start"]
+                probs.append(min(1.0, p))
+                p += ramp
+        return probs
+    p = play_probability(status, chance)
+    if status in ("a", "d"):
+        probs = []
+        for _ in range(n):
+            probs.append(min(1.0, p))
+            p += ramp
+        return probs
+    return [p] + [CONFIG["unknown_absence_prob"]] * (n - 1)
+
+
+def fit_label(status, chance, return_date, avail_next):
+    """Short human-readable fitness note for the tables."""
+    if status == "a" and chance in (None, 100):
+        return "Fit"
+    if avail_next == 0 and return_date is not None:
+        return f"Out (back {return_date.strftime('%d %b')})"
+    if avail_next == 0:
+        return "Out"
+    return f"{int(round(avail_next * 100))}%"
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +279,6 @@ def compute_fixture_ease(fixtures, start_gw, n_gws):
     Per team: sum of (6 - difficulty) over every fixture in the window.
     A double gameweek adds two fixtures' worth of ease; a blank adds nothing,
     so doubles are rewarded and blanks are punished automatically.
-    Also returns a short text list of opponents for display.
     """
     end_gw = start_gw + n_gws - 1
     ease = {}
@@ -146,12 +295,11 @@ def compute_fixture_ease(fixtures, start_gw, n_gws):
     return ease, opponents
 
 
-def normalise(series):
-    """Scale a pandas Series to 0..1 (all equal -> 0.5)."""
-    lo, hi = series.min(), series.max()
-    if hi == lo:
-        return pd.Series(0.5, index=series.index)
-    return (series - lo) / (hi - lo)
+def normalise_into(df, col, out, pool_mask):
+    """Scale df[col] to 0..1 using the pooled players' min/max."""
+    sub = df.loc[pool_mask, col]
+    rng = (sub.max() - sub.min()) or 1
+    df[out] = ((df[col] - sub.min()) / rng).clip(0, 1)
 
 
 def build_player_table(bootstrap, fixtures, horizon_gws):
@@ -162,15 +310,16 @@ def build_player_table(bootstrap, fixtures, horizon_gws):
     finished_gws = count_finished_gws(events)
 
     team_form = compute_team_form(fixtures, CONFIG["team_form_matches"])
-    ease_h, opp_h = compute_fixture_ease(fixtures, target_gw, horizon_gws)
+    ease_h, _ = compute_fixture_ease(fixtures, target_gw, horizon_gws)
     ease_1, opp_1 = compute_fixture_ease(fixtures, target_gw, 1)
+    deadlines = window_deadlines(events, target_gw, horizon_gws)
 
     total_team_goals = {}
-    rows = []
     for p in bootstrap["elements"]:
-        team_id = p["team"]
-        total_team_goals[team_id] = total_team_goals.get(team_id, 0) + p["goals_scored"]
+        total_team_goals[p["team"]] = (
+            total_team_goals.get(p["team"], 0) + p["goals_scored"])
 
+    rows = []
     for p in bootstrap["elements"]:
         team_id = p["team"]
         team = teams[team_id]
@@ -179,6 +328,14 @@ def build_player_table(bootstrap, fixtures, horizon_gws):
         next_fixture = ", ".join(
             f"{teams[o]['short_name']} ({venue})" for o, venue in opp_list
         ) or "BLANK"
+
+        status = p.get("status", "a")
+        chance = p.get("chance_of_playing_next_round")
+        return_date = parse_return_date(p.get("news"), deadlines[0])
+        schedule = availability_schedule(status, chance, return_date, deadlines)
+        avail_next = schedule[0]
+        avail_window = sum(schedule) / len(schedule)
+
         tf = team_form.get(team_id, {"scored": 0.0, "conceded": 0.0})
         # attackers care about goals scored; defenders/keepers about goals conceded
         if pos in ("MID", "FWD"):
@@ -195,6 +352,7 @@ def build_player_table(bootstrap, fixtures, horizon_gws):
             "team": team["short_name"],
             "pos": pos,
             "next_fixture": next_fixture,
+            "fit": fit_label(status, chance, return_date, avail_next),
             "price": p["now_cost"] / 10.0,
             "price_raw": p["now_cost"],
             "form": float(p.get("form") or 0),
@@ -203,50 +361,34 @@ def build_player_table(bootstrap, fixtures, horizon_gws):
             "minutes": p.get("minutes", 0),
             "goals": p.get("goals_scored", 0),
             "assists": p.get("assists", 0),
-            "status": p.get("status", "a"),
-            "chance": p.get("chance_of_playing_next_round"),
+            "status": status,
+            "avail_next": avail_next,
+            "avail_window": avail_window,
             "team_form_raw": tf_raw,
             "strength_raw": strength,
             "ease_h_raw": ease_h.get(team_id, 0),
             "ease_1_raw": ease_1.get(team_id, 0),
-            "fixtures_this_gw": len(opp_1.get(team_id, [])),
+            "fixtures_this_gw": len(opp_list),
             "team_goals_total": total_team_goals.get(team_id, 0),
         })
 
     df = pd.DataFrame(rows)
 
-    # Availability: fit, or doubtful with a >=75% chance of playing
-    df["available"] = (df["status"] == "a") | (
-        (df["status"] == "d") & (df["chance"].fillna(100) >= 75)
-    )
+    # Anyone effectively absent for most of the window drops out entirely
+    df["available"] = df["avail_window"] > CONFIG["min_window_availability"]
+    pool = df["available"]
 
-    # Minutes gate only applies once we trust current-season data
-    if finished_gws >= CONFIG["form_trust_gws"]:
-        needed = 90 * finished_gws * CONFIG["min_minutes_share"]
-        df["enough_minutes"] = df["minutes"] >= needed
-    else:
-        df["enough_minutes"] = True
+    for col, out in [("form", "form_n"), ("ep_next", "ep_n"), ("price_raw", "price_n"),
+                     ("ease_h_raw", "ease_h_n"), ("ease_1_raw", "ease_1_n")]:
+        normalise_into(df, col, out, pool)
 
-    df["eligible"] = df["available"] & df["enough_minutes"]
-
-    # Normalised components (computed across eligible players only, then
-    # applied to everyone so the squad solver can still price up fringe picks)
-    pool = df[df["eligible"]]
-    for col, out in [
-        ("form", "form_n"), ("ep_next", "ep_n"), ("price_raw", "price_n"),
-        ("ease_h_raw", "ease_h_n"), ("ease_1_raw", "ease_1_n"),
-    ]:
-        df[out] = ((df[col] - pool[col].min()) /
-                   ((pool[col].max() - pool[col].min()) or 1)).clip(0, 1)
-
-    # Team form and strength are normalised within position groups, because
-    # "goals conceded" numbers only make sense compared with other defences
-    for group_cols in [("team_form_raw", "team_form_n"), ("strength_raw", "strength_n")]:
-        raw, out = group_cols
+    # Team form and strength are normalised within attacker/defender groups,
+    # because goals-conceded numbers only compare with other defences
+    for raw, out in [("team_form_raw", "team_form_n"), ("strength_raw", "strength_n")]:
         df[out] = 0.5
         for att in (True, False):
             mask = df["pos"].isin(["MID", "FWD"]) if att else df["pos"].isin(["GKP", "DEF"])
-            sub = df.loc[mask & df["eligible"], raw]
+            sub = df.loc[mask & pool, raw]
             if len(sub) and sub.max() != sub.min():
                 df.loc[mask, out] = ((df.loc[mask, raw] - sub.min()) /
                                      (sub.max() - sub.min())).clip(0, 1)
@@ -255,14 +397,11 @@ def build_player_table(bootstrap, fixtures, horizon_gws):
     df["involvement"] = df.apply(
         lambda r: (r["goals"] + r["assists"]) / r["team_goals_total"]
         if r["team_goals_total"] > 0 else 0.0, axis=1)
-    inv_pool = df.loc[df["eligible"], "involvement"]
-    rng = (inv_pool.max() - inv_pool.min()) or 1
-    df["involvement_n"] = ((df["involvement"] - inv_pool.min()) / rng).clip(0, 1)
+    normalise_into(df, "involvement", "involvement_n", pool)
 
     # ------------------------------------------------------------------
-    # Composite scores.
-    # alpha slides from 0 (pre-season: trust pre-season signals) to 1
-    # (trust real current-season form) over the first few gameweeks.
+    # Composite scores. alpha slides from 0 (pre-season) to 1 (trust real
+    # current-season form) over the first few gameweeks.
     # ------------------------------------------------------------------
     alpha = min(finished_gws / CONFIG["form_trust_gws"], 1.0)
     wm, we = CONFIG["weights_mature"], CONFIG["weights_early"]
@@ -272,13 +411,46 @@ def build_player_table(bootstrap, fixtures, horizon_gws):
                 + wm["team_form"] * df["team_form_n"] + wm["ep"] * df["ep_n"])
     early_h = (we["fixture"] * df["ease_h_n"] + we["strength"] * df["strength_n"]
                + we["price"] * df["price_n"] + we["ep"] * df["ep_n"])
-    df["score_horizon"] = alpha * mature_h + (1 - alpha) * early_h
+    df["score_horizon"] = (alpha * mature_h + (1 - alpha) * early_h) * df["avail_window"]
 
     mature_1 = (cm["form"] * df["form_n"] + cm["fixture"] * df["ease_1_n"]
                 + cm["team_form"] * df["team_form_n"])
     early_1 = (ce["fixture"] * df["ease_1_n"] + ce["strength"] * df["strength_n"]
                + ce["price"] * df["price_n"])
-    df["score_gw"] = alpha * mature_1 + (1 - alpha) * early_1
+    df["score_gw"] = (alpha * mature_1 + (1 - alpha) * early_1) * df["avail_next"]
+
+    # ------------------------------------------------------------------
+    # Fitness/rotation ramp, once the season is underway: fetch recent
+    # minutes for the top candidates and scale scores accordingly
+    # ------------------------------------------------------------------
+    df["recent_minutes"] = pd.NA
+    if finished_gws >= CONFIG["form_trust_gws"]:
+        cand = df[df["available"]].copy()
+        cand["best"] = cand[["score_horizon", "score_gw"]].max(axis=1)
+        short_ids = tuple(sorted(
+            cand.nlargest(CONFIG["shortlist_size"], "best")["id"].tolist()))
+        since = finished_gws - CONFIG["ramp_recent_gws"]
+        try:
+            mins = fetch_recent_minutes(short_ids, since)
+        except Exception:
+            mins = {}
+        known = {pid: m for pid, m in mins.items() if m is not None}
+        df["recent_minutes"] = df["id"].map(known)
+
+        floor, full = CONFIG["ramp_floor"], CONFIG["ramp_full_minutes"]
+        ramp = df["recent_minutes"].map(
+            lambda m: 1.0 if pd.isna(m) else floor + (1 - floor) * min(m / full, 1.0))
+        df["score_horizon"] *= ramp
+        df["score_gw"] *= ramp
+
+        # Minutes gate: recent minutes where we have them, season share otherwise
+        season_ok = df["minutes"] >= 90 * finished_gws * CONFIG["min_minutes_share"]
+        recent_ok = df["recent_minutes"] >= CONFIG["gate_recent_minutes"]
+        df["enough_minutes"] = recent_ok.where(df["recent_minutes"].notna(), season_ok)
+    else:
+        df["enough_minutes"] = True
+
+    df["eligible"] = df["available"] & df["enough_minutes"].astype(bool)
 
     iw = CONFIG["involvement_weight"]
     df["score_diff"] = (1 - iw) * df["score_horizon"] + iw * df["involvement_n"]
@@ -346,12 +518,12 @@ def solve_squad(df, budget_m, score_col, bench_mode):
 # Display helpers
 # ---------------------------------------------------------------------------
 def show_table(df, score_col, extra_cols=None):
-    cols = ["name", "team", "pos", "next_fixture", "price", "form", "ownership"] + (extra_cols or []) + [score_col]
+    cols = (["name", "team", "pos", "next_fixture", "fit", "price", "form", "ownership"]
+            + (extra_cols or []) + [score_col])
     out = df[cols].rename(columns={
-        "name": "Player", "team": "Team", "pos": "Pos", "price": "Price (£m)",
-        "form": "Form", "ownership": "Owned %", "fixtures_this_gw": "Fixtures",
-        "next_fixture": "Next",
-        score_col: "Score",
+        "name": "Player", "team": "Team", "pos": "Pos", "next_fixture": "Next",
+        "fit": "Fit", "price": "Price (£m)", "form": "Form", "ownership": "Owned %",
+        "fixtures_this_gw": "Fixtures", score_col: "Score",
     })
     out["Score"] = out["Score"].round(3)
     st.dataframe(out, hide_index=True, width="stretch")
@@ -359,10 +531,10 @@ def show_table(df, score_col, extra_cols=None):
 
 def show_squad(squad, score_col):
     pos_order = {"GKP": 0, "DEF": 1, "MID": 2, "FWD": 3}
-    squad = squad.sort_values(by=["starter", "pos", score_col],
-                              key=lambda s: s.map(pos_order) if s.name == "pos" else s,
-                              ascending=[False, True, False])
-    starters = squad[squad["starter"]]
+    starters = squad[squad["starter"]].sort_values(
+        by=["pos", score_col],
+        key=lambda s: s.map(pos_order) if s.name == "pos" else s,
+        ascending=[True, False])
     bench = squad[~squad["starter"]].sort_values(
         by=["pos", score_col],
         key=lambda s: s.map(pos_order) if s.name == "pos" else s,
@@ -428,7 +600,8 @@ def main():
 
     for tab, label, score_col, blurb in [
         (tab_wc, "Wildcard", "score_horizon",
-         f"Optimised over the next {CONFIG['horizon_gws']} gameweeks."),
+         f"Optimised over the next {CONFIG['horizon_gws']} gameweeks. Injured or "
+         "suspended players are discounted for the weeks they are expected to miss."),
         (tab_fh, "Free Hit", "score_gw",
          f"Optimised for GW{target_gw} only (double gameweeks handled automatically)."),
     ]:
