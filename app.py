@@ -575,7 +575,7 @@ def render_header():
         st.markdown(
             f"""<div style="display:flex;align-items:center;gap:14px;margin-bottom:0.5rem">
             <img src="data:image/svg+xml;base64,{b64}" style="height:56px" alt="logo">
-            <h1 style="margin:0;padding:0">FPL Ones to Watch</h1></div>""",
+            <h1 style="margin:0;padding:0">Ones to Watch</h1></div>""",
             unsafe_allow_html=True)
     else:
         st.title("⚽ FPL Ones to Watch")
