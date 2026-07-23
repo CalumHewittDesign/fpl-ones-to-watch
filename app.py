@@ -22,10 +22,14 @@ import datetime as dt
 import re
 from concurrent.futures import ThreadPoolExecutor
 
+import base64
+import os
+
 import requests
 import pandas as pd
 import pulp
 import streamlit as st
+import streamlit.components.v1 as components
 
 # ---------------------------------------------------------------------------
 # CONFIG - tweak the app's behaviour here
@@ -98,6 +102,11 @@ XI_MIN = {"GKP": 1, "DEF": 3, "MID": 2, "FWD": 1}
 XI_MAX = {"GKP": 1, "DEF": 5, "MID": 5, "FWD": 3}
 
 API_BASE = "https://fantasy.premierleague.com/api/"
+# Branding assets (the app falls back to plain text/emoji if these are
+# missing from the repository, so nothing breaks without them)
+LOGO_PATH = "logo.svg"
+TOUCH_ICON_PATH = "static/apple-touch-icon.png"
+
 # FPL sometimes rejects requests without a browser-like user agent
 HEADERS = {"User-Agent": "Mozilla/5.0 (personal FPL recommender)"}
 
@@ -555,9 +564,44 @@ def show_squad(squad, score_col):
 # ---------------------------------------------------------------------------
 # The app
 # ---------------------------------------------------------------------------
+def render_header():
+    """Logo + title if logo.svg is in the repo, emoji title otherwise."""
+    if os.path.exists(LOGO_PATH):
+        b64 = base64.b64encode(open(LOGO_PATH, "rb").read()).decode()
+        st.markdown(
+            f"""<div style="display:flex;align-items:center;gap:14px;margin-bottom:0.5rem">
+            <img src="data:image/svg+xml;base64,{b64}" style="height:56px" alt="logo">
+            <h1 style="margin:0;padding:0">FPL Ones to Watch</h1></div>""",
+            unsafe_allow_html=True)
+    else:
+        st.title("⚽ FPL Ones to Watch")
+
+
+def inject_touch_icon():
+    """Tell iOS which icon to use for Add to Home Screen. Streamlit has no
+    official way to set this, so a tiny script adds the tag to the page head.
+    Harmless if it ever stops working (iOS just falls back to a screenshot)."""
+    # components.html is proven to reach the parent page head; prefer it while
+    # it exists, fall back to st.iframe if a future Streamlit removes it
+    render_html = components.html if hasattr(components, "html") else st.iframe
+    render_html(
+        """<script>
+        const doc = window.parent.document;
+        if (!doc.querySelector("link[rel='apple-touch-icon']")) {
+            const l = doc.createElement('link');
+            l.rel = 'apple-touch-icon';
+            l.sizes = '180x180';
+            l.href = window.parent.location.origin + '/app/static/apple-touch-icon.png';
+            doc.head.appendChild(l);
+        }
+        </script>""", height=0)
+
+
 def main():
-    st.set_page_config(page_title="FPL Ones to Watch", page_icon="⚽")
-    st.title("⚽ FPL Ones to Watch")
+    icon = TOUCH_ICON_PATH if os.path.exists(TOUCH_ICON_PATH) else "⚽"
+    st.set_page_config(page_title="FPL Ones to Watch", page_icon=icon)
+    render_header()
+    inject_touch_icon()
 
     try:
         bootstrap, fixtures = fetch_fpl_data()
