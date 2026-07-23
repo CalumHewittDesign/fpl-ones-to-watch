@@ -571,7 +571,7 @@ def render_header():
         st.markdown(
             f"""<div style="display:flex;align-items:center;gap:14px;margin-bottom:0.5rem">
             <img src="data:image/svg+xml;base64,{b64}" style="height:56px" alt="logo">
-            <h1 style="margin:0;padding:0">Ones to Watch</h1></div>""",
+            <h1 style="margin:0;padding:0">FPL Ones to Watch</h1></div>""",
             unsafe_allow_html=True)
     else:
         st.title("⚽ FPL Ones to Watch")
@@ -587,19 +587,27 @@ def inject_touch_icon():
     render_html(
         """<script>
         const doc = window.parent.document;
-        if (!doc.querySelector("link[rel='apple-touch-icon']")) {
-            const l = doc.createElement('link');
-            l.rel = 'apple-touch-icon';
-            l.sizes = '180x180';
-            l.href = window.parent.location.origin + '/app/static/apple-touch-icon.png';
-            doc.head.appendChild(l);
+        // Streamlit ships its own icon tags; remove them so iOS uses ours
+        doc.querySelectorAll("link[rel*='apple-touch-icon']").forEach(l => l.remove());
+        const l = doc.createElement('link');
+        l.rel = 'apple-touch-icon';
+        l.sizes = '180x180';
+        l.href = window.parent.location.origin + '/app/static/apple-touch-icon.png';
+        doc.head.appendChild(l);
+        // default name shown on the Add to Home Screen sheet
+        let m = doc.querySelector("meta[name='apple-mobile-web-app-title']");
+        if (!m) {
+            m = doc.createElement('meta');
+            m.name = 'apple-mobile-web-app-title';
+            doc.head.appendChild(m);
         }
+        m.content = 'FPL Watch';
         </script>""", height=0)
 
 
 def main():
     icon = TOUCH_ICON_PATH if os.path.exists(TOUCH_ICON_PATH) else "⚽"
-    st.set_page_config(page_title="Ones to Watch", page_icon=icon)
+    st.set_page_config(page_title="FPL Ones to Watch", page_icon=icon)
     render_header()
     inject_touch_icon()
 
