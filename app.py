@@ -106,6 +106,10 @@ API_BASE = "https://fantasy.premierleague.com/api/"
 # missing from the repository, so nothing breaks without them)
 LOGO_PATH = "logo.svg"
 TOUCH_ICON_PATH = "static/apple-touch-icon.png"
+# Home screen icon URL. Leave "" to use the app's own static serving; if that
+# isn't working, paste the GitHub "Raw" URL of apple-touch-icon.png here, e.g.
+# "https://raw.githubusercontent.com/YOUR-USERNAME/fpl-ones-to-watch/main/static/apple-touch-icon.png"
+TOUCH_ICON_URL = ""
 
 # FPL sometimes rejects requests without a browser-like user agent
 HEADERS = {"User-Agent": "Mozilla/5.0 (personal FPL recommender)"}
@@ -577,6 +581,12 @@ def render_header():
         st.title("⚽ FPL Ones to Watch")
 
 
+def _icon_href_js():
+    if TOUCH_ICON_URL:
+        return f"'{TOUCH_ICON_URL}'"
+    return "window.parent.location.origin + '/app/static/apple-touch-icon.png'"
+
+
 def inject_touch_icon():
     """Tell iOS which icon to use for Add to Home Screen. Streamlit has no
     official way to set this, so a tiny script adds the tag to the page head.
@@ -584,15 +594,14 @@ def inject_touch_icon():
     # components.html is proven to reach the parent page head; prefer it while
     # it exists, fall back to st.iframe if a future Streamlit removes it
     render_html = components.html if hasattr(components, "html") else st.iframe
-    render_html(
-        """<script>
+    script = """<script>
         const doc = window.parent.document;
         // Streamlit ships its own icon tags; remove them so iOS uses ours
         doc.querySelectorAll("link[rel*='apple-touch-icon']").forEach(l => l.remove());
         const l = doc.createElement('link');
         l.rel = 'apple-touch-icon';
         l.sizes = '180x180';
-        l.href = window.parent.location.origin + '/app/static/apple-touch-icon.png';
+        l.href = ICON_HREF_JS;
         doc.head.appendChild(l);
         // default name shown on the Add to Home Screen sheet
         let m = doc.querySelector("meta[name='apple-mobile-web-app-title']");
@@ -602,7 +611,8 @@ def inject_touch_icon():
             doc.head.appendChild(m);
         }
         m.content = 'FPL Watch';
-        </script>""", height=0)
+        </script>""".replace("ICON_HREF_JS", _icon_href_js())
+    render_html(script, height=0)
 
 
 def main():
